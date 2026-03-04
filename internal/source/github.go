@@ -350,11 +350,27 @@ func (s *GitHubSource) fetchIssuesPage(ctx context.Context, pageURL string) ([]g
 }
 
 func (s *GitHubSource) fetchComments(ctx context.Context, issueNumber int) ([]githubComment, error) {
-	u := fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments?per_page=100", s.baseURL(), s.Owner, s.Repo, issueNumber)
+	var allComments []githubComment
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	pageURL := fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments?per_page=100",
+		s.baseURL(), s.Owner, s.Repo, issueNumber)
+
+	for page := 0; pageURL != "" && page < maxPages; page++ {
+		comments, nextURL, err := s.fetchCommentsPage(ctx, pageURL)
+		if err != nil {
+			return nil, err
+		}
+		allComments = append(allComments, comments...)
+		pageURL = nextURL
+	}
+
+	return allComments, nil
+}
+
+func (s *GitHubSource) fetchCommentsPage(ctx context.Context, pageURL string) ([]githubComment, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, "", fmt.Errorf("creating request: %w", err)
 	}
 
 	if s.Token != "" {
@@ -364,35 +380,58 @@ func (s *GitHubSource) fetchComments(ctx context.Context, issueNumber int) ([]gi
 
 	resp, err := s.httpClient().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetching comments: %w", err)
+		return nil, "", fmt.Errorf("fetching comments: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("GitHub API returned status %d: %s", resp.StatusCode, string(body))
+		return nil, "", fmt.Errorf("GitHub API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var comments []githubComment
 	if err := json.NewDecoder(resp.Body).Decode(&comments); err != nil {
-		return nil, fmt.Errorf("decoding comments: %w", err)
+		return nil, "", fmt.Errorf("decoding comments: %w", err)
 	}
 
-	return comments, nil
+	nextURL := parseNextLink(resp.Header.Get("Link"))
+
+	return comments, nextURL, nil
 }
 
 // concatCommentBodies joins comment bodies into a single string separated by
-// "\n---\n", matching the format expected by passesCommentFilter. Bodies are
-// truncated at maxCommentBytes to bound memory usage.
+// "\n---\n", matching the format expected by passesCommentFilter. When the
+// total size exceeds maxCommentBytes, older comments are dropped from the
+// front so that the most recent (and most relevant) comments are preserved.
 func concatCommentBodies(comments []githubComment) string {
-	var parts []string
 	totalBytes := 0
 	for _, c := range comments {
 		totalBytes += len(c.Body)
-		if totalBytes > maxCommentBytes {
+	}
+
+	// If within budget, return all comments.
+	if totalBytes <= maxCommentBytes {
+		parts := make([]string, len(comments))
+		for i, c := range comments {
+			parts[i] = c.Body
+		}
+		return strings.Join(parts, "\n---\n")
+	}
+
+	// Truncate from the front: keep the most recent comments.
+	var parts []string
+	remaining := maxCommentBytes
+	for i := len(comments) - 1; i >= 0; i-- {
+		if remaining-len(comments[i].Body) < 0 {
 			break
 		}
-		parts = append(parts, c.Body)
+		remaining -= len(comments[i].Body)
+		parts = append(parts, comments[i].Body)
+	}
+
+	// Reverse so comments are back in chronological order.
+	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+		parts[i], parts[j] = parts[j], parts[i]
 	}
 	return strings.Join(parts, "\n---\n")
 }

@@ -1177,3 +1177,151 @@ func TestDiscoverTriggerTimeZeroWithoutTriggerComment(t *testing.T) {
 		t.Errorf("TriggerTime = %v, want zero time when TriggerComment not configured", items[0].TriggerTime)
 	}
 }
+
+func TestDiscoverCommentPagination(t *testing.T) {
+	issues := []githubIssue{
+		{Number: 1, Title: "Bug", Body: "Details", HTMLURL: "https://github.com/o/r/issues/1"},
+	}
+
+	page1Comments := []githubComment{
+		{Body: "comment-page1-a"},
+		{Body: "comment-page1-b"},
+	}
+	page2Comments := []githubComment{
+		{Body: "comment-page2-a"},
+		{Body: "comment-page2-b"},
+	}
+
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/owner/repo/issues":
+			json.NewEncoder(w).Encode(issues)
+		case r.URL.Path == "/repos/owner/repo/issues/1/comments":
+			if r.URL.Query().Get("page") == "2" {
+				json.NewEncoder(w).Encode(page2Comments)
+				return
+			}
+			w.Header().Set("Link", fmt.Sprintf(`<%s/repos/owner/repo/issues/1/comments?page=2>; rel="next"`, serverURL))
+			json.NewEncoder(w).Encode(page1Comments)
+		}
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	s := &GitHubSource{
+		Owner:   "owner",
+		Repo:    "repo",
+		BaseURL: server.URL,
+	}
+
+	items, err := s.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+
+	expected := "comment-page1-a\n---\ncomment-page1-b\n---\ncomment-page2-a\n---\ncomment-page2-b"
+	if items[0].Comments != expected {
+		t.Errorf("expected comments %q, got %q", expected, items[0].Comments)
+	}
+}
+
+func TestDiscoverCommentPaginationTrigger(t *testing.T) {
+	// The trigger comment is on the second page of comments, verifying
+	// that pagination fetches it.
+	issues := []githubIssue{
+		{Number: 1, Title: "Bug", Body: "Details", HTMLURL: "https://github.com/o/r/issues/1"},
+	}
+
+	page1Comments := []githubComment{
+		{Body: "regular comment", CreatedAt: "2026-01-01T10:00:00Z"},
+	}
+	page2Comments := []githubComment{
+		{Body: "/kelos pick-up", CreatedAt: "2026-01-02T10:00:00Z"},
+	}
+
+	var serverURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/owner/repo/issues":
+			json.NewEncoder(w).Encode(issues)
+		case r.URL.Path == "/repos/owner/repo/issues/1/comments":
+			if r.URL.Query().Get("page") == "2" {
+				json.NewEncoder(w).Encode(page2Comments)
+				return
+			}
+			w.Header().Set("Link", fmt.Sprintf(`<%s/repos/owner/repo/issues/1/comments?page=2>; rel="next"`, serverURL))
+			json.NewEncoder(w).Encode(page1Comments)
+		}
+	}))
+	defer server.Close()
+	serverURL = server.URL
+
+	s := &GitHubSource{
+		Owner:          "owner",
+		Repo:           "repo",
+		BaseURL:        server.URL,
+		TriggerComment: "/kelos pick-up",
+	}
+
+	items, err := s.Discover(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item (trigger on page 2), got %d", len(items))
+	}
+
+	expected, _ := time.Parse(time.RFC3339, "2026-01-02T10:00:00Z")
+	if !items[0].TriggerTime.Equal(expected) {
+		t.Errorf("TriggerTime = %v, want %v", items[0].TriggerTime, expected)
+	}
+}
+
+func TestConcatCommentBodiesKeepsRecentOnTruncation(t *testing.T) {
+	// Build comments where total exceeds maxCommentBytes. The most recent
+	// comments (at the end) should be kept, not the oldest.
+	oldComment := githubComment{Body: strings.Repeat("O", 40*1024)}    // 40KB
+	middleComment := githubComment{Body: strings.Repeat("M", 40*1024)} // 40KB — total now 80KB > 64KB
+	newestComment := githubComment{Body: strings.Repeat("Z", 1024)}    // 1KB
+
+	result := concatCommentBodies([]githubComment{oldComment, middleComment, newestComment})
+
+	if strings.Contains(result, "OOOOO") {
+		t.Error("expected old comment to be truncated, but it was included")
+	}
+	if !strings.Contains(result, middleComment.Body) {
+		t.Error("expected middle comment to be included")
+	}
+	if !strings.Contains(result, newestComment.Body) {
+		t.Error("expected newest comment to be included")
+	}
+}
+
+func TestConcatCommentBodiesNoBudgetForAny(t *testing.T) {
+	// A single comment that exceeds maxCommentBytes should result in an
+	// empty string (no comment fits the budget).
+	huge := githubComment{Body: strings.Repeat("X", maxCommentBytes+1)}
+	result := concatCommentBodies([]githubComment{huge})
+	if result != "" {
+		t.Errorf("expected empty string for oversized comment, got %d bytes", len(result))
+	}
+}
+
+func TestConcatCommentBodiesAllFit(t *testing.T) {
+	comments := []githubComment{
+		{Body: "first"},
+		{Body: "second"},
+		{Body: "third"},
+	}
+	result := concatCommentBodies(comments)
+	expected := "first\n---\nsecond\n---\nthird"
+	if result != expected {
+		t.Errorf("expected %q, got %q", expected, result)
+	}
+}
