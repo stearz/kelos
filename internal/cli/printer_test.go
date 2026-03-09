@@ -287,6 +287,187 @@ func TestPrintTaskSpawnerTableAllNamespaces(t *testing.T) {
 	}
 }
 
+func TestPrintTaskSpawnerTableGitHubPullRequests(t *testing.T) {
+	spawners := []kelosv1alpha1.TaskSpawner{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "pr-spawner",
+				CreationTimestamp: metav1.NewTime(time.Now().Add(-1 * time.Hour)),
+			},
+			Spec: kelosv1alpha1.TaskSpawnerSpec{
+				When: kelosv1alpha1.When{
+					GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{},
+				},
+				TaskTemplate: kelosv1alpha1.TaskTemplate{
+					WorkspaceRef: &kelosv1alpha1.WorkspaceReference{
+						Name: "my-ws",
+					},
+				},
+			},
+			Status: kelosv1alpha1.TaskSpawnerStatus{
+				Phase: kelosv1alpha1.TaskSpawnerPhaseRunning,
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	printTaskSpawnerTable(&buf, spawners, false)
+	output := buf.String()
+
+	if !strings.Contains(output, "my-ws") {
+		t.Errorf("expected workspace name as source in output, got %q", output)
+	}
+}
+
+func TestPrintTaskSpawnerTableGitHubPullRequestsNoWorkspace(t *testing.T) {
+	spawners := []kelosv1alpha1.TaskSpawner{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "pr-spawner",
+				CreationTimestamp: metav1.NewTime(time.Now().Add(-1 * time.Hour)),
+			},
+			Spec: kelosv1alpha1.TaskSpawnerSpec{
+				When: kelosv1alpha1.When{
+					GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{},
+				},
+			},
+			Status: kelosv1alpha1.TaskSpawnerStatus{
+				Phase: kelosv1alpha1.TaskSpawnerPhaseRunning,
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	printTaskSpawnerTable(&buf, spawners, false)
+	output := buf.String()
+
+	if !strings.Contains(output, "GitHub Pull Requests") {
+		t.Errorf("expected 'GitHub Pull Requests' as source in output, got %q", output)
+	}
+}
+
+func TestPrintTaskSpawnerTableJira(t *testing.T) {
+	spawners := []kelosv1alpha1.TaskSpawner{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "jira-spawner",
+				CreationTimestamp: metav1.NewTime(time.Now().Add(-1 * time.Hour)),
+			},
+			Spec: kelosv1alpha1.TaskSpawnerSpec{
+				When: kelosv1alpha1.When{
+					Jira: &kelosv1alpha1.Jira{
+						BaseURL: "https://mycompany.atlassian.net",
+						Project: "PROJ",
+						SecretRef: kelosv1alpha1.SecretReference{
+							Name: "jira-secret",
+						},
+					},
+				},
+			},
+			Status: kelosv1alpha1.TaskSpawnerStatus{
+				Phase: kelosv1alpha1.TaskSpawnerPhaseRunning,
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	printTaskSpawnerTable(&buf, spawners, false)
+	output := buf.String()
+
+	if !strings.Contains(output, "PROJ") {
+		t.Errorf("expected Jira project as source in output, got %q", output)
+	}
+}
+
+func TestPrintTaskSpawnerDetailGitHubPullRequests(t *testing.T) {
+	spawner := &kelosv1alpha1.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pr-spawner",
+			Namespace: "default",
+		},
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{
+					State:       "open",
+					Labels:      []string{"bug", "help-wanted"},
+					ReviewState: "changes_requested",
+				},
+			},
+			TaskTemplate: kelosv1alpha1.TaskTemplate{
+				Type: "claude-code",
+				WorkspaceRef: &kelosv1alpha1.WorkspaceReference{
+					Name: "my-ws",
+				},
+			},
+			PollInterval: "5m",
+		},
+		Status: kelosv1alpha1.TaskSpawnerStatus{
+			Phase:             kelosv1alpha1.TaskSpawnerPhaseRunning,
+			TotalDiscovered:   3,
+			TotalTasksCreated: 2,
+		},
+	}
+
+	var buf bytes.Buffer
+	printTaskSpawnerDetail(&buf, spawner)
+	output := buf.String()
+
+	for _, expected := range []string{
+		"Source:", "GitHub Pull Requests",
+		"State:", "open",
+		"Labels:", "[bug help-wanted]",
+		"Review State:", "changes_requested",
+	} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("expected %q in detail output, got %q", expected, output)
+		}
+	}
+}
+
+func TestPrintTaskSpawnerDetailJira(t *testing.T) {
+	spawner := &kelosv1alpha1.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "jira-spawner",
+			Namespace: "default",
+		},
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				Jira: &kelosv1alpha1.Jira{
+					BaseURL: "https://mycompany.atlassian.net",
+					Project: "PROJ",
+					JQL:     "status = Open",
+					SecretRef: kelosv1alpha1.SecretReference{
+						Name: "jira-secret",
+					},
+				},
+			},
+			TaskTemplate: kelosv1alpha1.TaskTemplate{
+				Type: "claude-code",
+			},
+			PollInterval: "10m",
+		},
+		Status: kelosv1alpha1.TaskSpawnerStatus{
+			Phase:             kelosv1alpha1.TaskSpawnerPhaseRunning,
+			TotalDiscovered:   5,
+			TotalTasksCreated: 3,
+		},
+	}
+
+	var buf bytes.Buffer
+	printTaskSpawnerDetail(&buf, spawner)
+	output := buf.String()
+
+	for _, expected := range []string{
+		"Source:", "Jira",
+		"Project:", "PROJ",
+		"JQL:", "status = Open",
+	} {
+		if !strings.Contains(output, expected) {
+			t.Errorf("expected %q in detail output, got %q", expected, output)
+		}
+	}
+}
+
 func TestPrintWorkspaceDetail(t *testing.T) {
 	ws := &kelosv1alpha1.Workspace{
 		ObjectMeta: metav1.ObjectMeta{
