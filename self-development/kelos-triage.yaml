@@ -11,7 +11,7 @@ spec:
       labels:
         - needs-actor
       excludeLabels:
-        - kelos/needs-input
+        - triage-accepted
   maxConcurrency: 8
   taskTemplate:
     workspaceRef:
@@ -140,18 +140,14 @@ spec:
       ```
 
       After posting the comment, update labels to complete the triage lifecycle.
-      Apply the actor label in the same command to avoid a race condition where
-      workers pick up the issue before `kelos/needs-input` is set.
 
       If recommending `actor/kelos`:
-        `gh issue edit {{.Number}} --add-label triage-accepted --add-label kelos/needs-input --add-label actor/kelos --remove-label needs-triage --remove-label needs-actor`
+        `gh issue edit {{.Number}} --add-label triage-accepted --add-label actor/kelos --remove-label needs-triage --remove-label needs-actor`
 
       If leaving `needs-actor`:
-        `gh issue edit {{.Number}} --add-label triage-accepted --add-label kelos/needs-input --remove-label needs-triage`
+        `gh issue edit {{.Number}} --add-label triage-accepted --remove-label needs-triage`
 
-      The `kelos/needs-input` label ensures a maintainer reviews before any worker
-      agent picks up the issue. The maintainer can override priority or actor
-      labels, then remove `kelos/needs-input` to approve.
+      The `triage-accepted` label prevents re-triage.
 
       Do NOT open PRs, push code, or modify any files. Read-only analysis only
       (except for the comment and labels above).

@@ -81,15 +81,34 @@ Picks up open GitHub issues labeled `actor/kelos` and creates autonomous agent t
 - Automatically checks for existing PRs and updates them incrementally
 - Self-reviews PRs before requesting human review
 - Ensures CI passes before completion
-- Labels issues with `kelos/needs-input` when human input is needed
-- Creates a feedback loop: remove the label to re-queue the issue
-- Supports manual reset via `/reset-worker` comment from a repository admin:
-  - Deletes `Task/kelos-workers-<ISSUE-NUMBER>` so it can be recreated with the same name
-  - Removes `kelos/needs-input` from the relevant issue and PR
+- Requires a `/kelos pick-up` comment to pick up an issue (maintainer approval gate)
+- Hands off PR review feedback to `kelos-pr-responder`
 
 **Deploy:**
 ```bash
 kubectl apply -f self-development/kelos-workers.yaml
+```
+
+### kelos-pr-responder.yaml
+
+Picks up open GitHub pull requests labeled `generated-by-kelos` when a reviewer requests changes.
+
+| | |
+|---|---|
+| **Trigger** | GitHub Pull Requests with `generated-by-kelos` label and `changes requested` review state |
+| **Model** | Opus |
+| **Concurrency** | 2 |
+
+**Key features:**
+- Reuses the existing PR branch instead of starting over
+- Reads review comments and PR conversation before making incremental changes
+- Lets the maintainer stay on the PR page for the common review-feedback loop
+- Requires `/kelos pick-up` PR comment to be picked up
+- Uses `/kelos needs-input` PR comments to pause when human input is required
+
+**Deploy:**
+```bash
+kubectl apply -f self-development/kelos-pr-responder.yaml
 ```
 
 ### kelos-triage.yaml
@@ -110,7 +129,7 @@ Picks up open GitHub issues labeled `needs-actor` and performs automated triage.
 5. Assesses priority (`priority/important-soon`, `priority/important-longterm`, `priority/backlog`)
 6. Recommends an actor — assigns `actor/kelos` if the issue has clear scope and verifiable criteria, otherwise leaves `needs-actor` for human decision
 
-Posts a single triage comment with its findings and adds `kelos/needs-input` for maintainer review before any worker agent picks up the issue.
+Posts a single triage comment with its findings, adds the `kelos/needs-input` label (to prevent re-triage), and posts a `/kelos needs-input` comment (to prevent workers from picking up the issue before maintainer review).
 
 **Deploy:**
 ```bash
@@ -255,15 +274,14 @@ To adapt these examples for your own repository:
 
 ## Feedback Loop Pattern
 
-The key pattern in these examples is the `excludeLabels: [kelos/needs-input]` configuration. This creates an autonomous feedback loop:
+The key pattern in these examples uses `triggerComment` and `excludeComments` to create an autonomous feedback loop:
 
-1. Agent picks up an open issue without the `kelos/needs-input` label
-2. Agent investigates, creates/updates a PR, and self-reviews
-3. If the agent needs human input, it adds the `kelos/needs-input` label
-4. The issue is excluded from future polls until a human removes the label
-5. Removing the label re-queues the issue on the next poll
+1. A maintainer posts a `/kelos pick-up` comment to approve an issue for agent work
+2. Agent picks up the issue, investigates, creates/updates a PR, and self-reviews
+3. If the agent needs human input, it posts a `/kelos needs-input` comment
+4. The maintainer can re-trigger the agent by posting the trigger comment again
 
-This allows agents to work fully autonomously while gracefully handing off to humans when needed.
+This allows agents to work fully autonomously while keeping a maintainer approval gate, without requiring any external GitHub Actions or label management.
 
 ## Troubleshooting
 
