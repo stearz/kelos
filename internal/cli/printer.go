@@ -148,6 +148,14 @@ func printTaskSpawnerTable(w io.Writer, spawners []kelosv1alpha1.TaskSpawner, al
 			} else {
 				source = "GitHub Issues"
 			}
+		} else if s.Spec.When.GitHubPullRequests != nil {
+			if s.Spec.TaskTemplate.WorkspaceRef != nil {
+				source = s.Spec.TaskTemplate.WorkspaceRef.Name
+			} else {
+				source = "GitHub Pull Requests"
+			}
+		} else if s.Spec.When.Jira != nil {
+			source = s.Spec.When.Jira.Project
 		} else if s.Spec.When.Cron != nil {
 			source = "cron: " + s.Spec.When.Cron.Schedule
 		}
@@ -182,6 +190,25 @@ func printTaskSpawnerDetail(w io.Writer, ts *kelosv1alpha1.TaskSpawner) {
 		}
 		if len(gh.Labels) > 0 {
 			printField(w, "Labels", fmt.Sprintf("%v", gh.Labels))
+		}
+	} else if ts.Spec.When.GitHubPullRequests != nil {
+		gh := ts.Spec.When.GitHubPullRequests
+		printField(w, "Source", "GitHub Pull Requests")
+		if gh.State != "" {
+			printField(w, "State", gh.State)
+		}
+		if len(gh.Labels) > 0 {
+			printField(w, "Labels", fmt.Sprintf("%v", gh.Labels))
+		}
+		if gh.ReviewState != "" {
+			printField(w, "Review State", gh.ReviewState)
+		}
+	} else if ts.Spec.When.Jira != nil {
+		jira := ts.Spec.When.Jira
+		printField(w, "Source", "Jira")
+		printField(w, "Project", jira.Project)
+		if jira.JQL != "" {
+			printField(w, "JQL", jira.JQL)
 		}
 	} else if ts.Spec.When.Cron != nil {
 		printField(w, "Source", "Cron")
