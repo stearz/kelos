@@ -17,10 +17,13 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
+	"github.com/kelos-dev/kelos/internal/reporting"
 	"github.com/kelos-dev/kelos/internal/source"
 )
 
@@ -84,33 +87,74 @@ func main() {
 
 	log.Info("Starting spawner", "taskspawner", key, "oneShot", oneShot)
 
+	cfgArgs := spawnerRuntimeConfig{
+		GitHubOwner:      githubOwner,
+		GitHubRepo:       githubRepo,
+		GitHubAPIBaseURL: githubAPIBaseURL,
+		GitHubTokenFile:  githubTokenFile,
+		JiraBaseURL:      jiraBaseURL,
+		JiraProject:      jiraProject,
+		JiraJQL:          jiraJQL,
+	}
+
 	if oneShot {
-		if err := runCycle(ctx, cl, key, githubOwner, githubRepo, githubAPIBaseURL, githubTokenFile, jiraBaseURL, jiraProject, jiraJQL); err != nil {
-			log.Error(err, "Discovery cycle failed")
+		if _, err := runOnce(ctx, cl, key, cfgArgs); err != nil {
+			log.Error(err, "Cycle failed")
 			os.Exit(1)
 		}
 		return
 	}
 
-	for {
-		if err := runCycle(ctx, cl, key, githubOwner, githubRepo, githubAPIBaseURL, githubTokenFile, jiraBaseURL, jiraProject, jiraJQL); err != nil {
-			log.Error(err, "Discovery cycle failed")
-		}
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:                 scheme,
+		HealthProbeBindAddress: "0",
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		Cache: cache.Options{
+			DefaultNamespaces: map[string]cache.Config{
+				namespace: {},
+			},
+		},
+	})
+	if err != nil {
+		log.Error(err, "Unable to create manager")
+		os.Exit(1)
+	}
 
-		// Re-read the TaskSpawner to get the current poll interval
-		var ts kelosv1alpha1.TaskSpawner
-		if err := cl.Get(ctx, key, &ts); err != nil {
-			log.Error(err, "Unable to fetch TaskSpawner for poll interval")
-			sleepOrDone(ctx, 5*time.Minute)
-			continue
-		}
+	if err := (&spawnerReconciler{
+		Client: cl,
+		Key:    key,
+		Config: cfgArgs,
+	}).SetupWithManager(mgr); err != nil {
+		log.Error(err, "Unable to create controller")
+		os.Exit(1)
+	}
 
-		interval := parsePollInterval(ts.Spec.PollInterval)
-		log.Info("Sleeping until next cycle", "interval", interval)
-		if done := sleepOrDone(ctx, interval); done {
-			return
+	if err := mgr.Start(ctx); err != nil {
+		log.Error(err, "Manager exited with error")
+		os.Exit(1)
+	}
+}
+
+// runReportingCycle lists all Tasks owned by the given TaskSpawner and runs
+// reporting for each one that has GitHub reporting enabled. Running this
+// in the same goroutine as the discovery loop avoids races between Task
+// creation/deletion and annotation patching.
+func runReportingCycle(ctx context.Context, cl client.Client, key types.NamespacedName, reporter *reporting.TaskReporter) error {
+	var taskList kelosv1alpha1.TaskList
+	if err := cl.List(ctx, &taskList,
+		client.InNamespace(key.Namespace),
+		client.MatchingLabels{"kelos.dev/taskspawner": key.Name},
+	); err != nil {
+		return fmt.Errorf("listing tasks for reporting: %w", err)
+	}
+
+	for i := range taskList.Items {
+		if err := reporter.ReportTaskStatus(ctx, &taskList.Items[i]); err != nil {
+			ctrl.Log.WithName("spawner").Error(err, "Reporting task status", "task", taskList.Items[i].Name)
+			// Continue with remaining tasks rather than aborting the cycle
 		}
 	}
+	return nil
 }
 
 func runCycle(ctx context.Context, cl client.Client, key types.NamespacedName, githubOwner, githubRepo, githubAPIBaseURL, githubTokenFile, jiraBaseURL, jiraProject, jiraJQL string) error {
@@ -259,6 +303,8 @@ func runCycleWithSource(ctx context.Context, cl client.Client, key types.Namespa
 			continue
 		}
 
+		annotations := sourceAnnotations(&ts, item)
+
 		task := &kelosv1alpha1.Task{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      taskName,
@@ -266,6 +312,7 @@ func runCycleWithSource(ctx context.Context, cl client.Client, key types.Namespa
 				Labels: map[string]string{
 					"kelos.dev/taskspawner": ts.Name,
 				},
+				Annotations: annotations,
 			},
 			Spec: kelosv1alpha1.TaskSpec{
 				Type:                    ts.Spec.TaskTemplate.Type,
@@ -366,6 +413,43 @@ func runCycleWithSource(ctx context.Context, cl client.Client, key types.Namespa
 	}
 
 	return nil
+}
+
+// sourceAnnotations returns annotations that stamp GitHub source metadata
+// onto a spawned Task. These annotations enable downstream consumers (such
+// as the reporting watcher) to identify the originating issue or PR.
+func sourceAnnotations(ts *kelosv1alpha1.TaskSpawner, item source.WorkItem) map[string]string {
+	if ts.Spec.When.GitHubIssues == nil && ts.Spec.When.GitHubPullRequests == nil {
+		return nil
+	}
+
+	kind := "issue"
+	if item.Kind == "PR" {
+		kind = "pull-request"
+	}
+
+	annotations := map[string]string{
+		reporting.AnnotationSourceKind:   kind,
+		reporting.AnnotationSourceNumber: strconv.Itoa(item.Number),
+	}
+
+	if reportingEnabled(ts) {
+		annotations[reporting.AnnotationGitHubReporting] = "enabled"
+	}
+
+	return annotations
+}
+
+// reportingEnabled returns true when GitHub reporting is configured and enabled
+// on the TaskSpawner.
+func reportingEnabled(ts *kelosv1alpha1.TaskSpawner) bool {
+	if ts.Spec.When.GitHubIssues != nil && ts.Spec.When.GitHubIssues.Reporting != nil {
+		return ts.Spec.When.GitHubIssues.Reporting.Enabled
+	}
+	if ts.Spec.When.GitHubPullRequests != nil && ts.Spec.When.GitHubPullRequests.Reporting != nil {
+		return ts.Spec.When.GitHubPullRequests.Reporting.Enabled
+	}
+	return false
 }
 
 func buildSource(ts *kelosv1alpha1.TaskSpawner, owner, repo, apiBaseURL, tokenFile, jiraBaseURL, jiraProject, jiraJQL string) (source.Source, error) {
@@ -538,13 +622,4 @@ func parsePollInterval(s string) time.Duration {
 		return 5 * time.Minute
 	}
 	return d
-}
-
-func sleepOrDone(ctx context.Context, d time.Duration) bool {
-	select {
-	case <-ctx.Done():
-		return true
-	case <-time.After(d):
-		return false
-	}
 }

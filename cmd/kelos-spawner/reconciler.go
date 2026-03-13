@@ -1,0 +1,170 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
+	"github.com/kelos-dev/kelos/internal/reporting"
+)
+
+type spawnerRuntimeConfig struct {
+	GitHubOwner      string
+	GitHubRepo       string
+	GitHubAPIBaseURL string
+	GitHubTokenFile  string
+	JiraBaseURL      string
+	JiraProject      string
+	JiraJQL          string
+}
+
+type spawnerReconciler struct {
+	client.Client
+	Key    types.NamespacedName
+	Config spawnerRuntimeConfig
+}
+
+func (r *spawnerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	if req.NamespacedName != r.Key {
+		return ctrl.Result{}, nil
+	}
+
+	interval, err := runOnce(ctx, r.Client, r.Key, r.Config)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: interval}, nil
+}
+
+func (r *spawnerReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		Named("taskspawner-loop").
+		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
+		For(&kelosv1alpha1.TaskSpawner{}, builder.WithPredicates(r.taskSpawnerPredicate())).
+		Watches(
+			&kelosv1alpha1.Task{},
+			handler.EnqueueRequestsFromMapFunc(r.requestsForTask),
+			builder.WithPredicates(r.taskPredicate()),
+		).
+		Complete(r)
+}
+
+func runOnce(ctx context.Context, cl client.Client, key types.NamespacedName, cfg spawnerRuntimeConfig) (time.Duration, error) {
+	if err := runCycle(ctx, cl, key, cfg.GitHubOwner, cfg.GitHubRepo, cfg.GitHubAPIBaseURL, cfg.GitHubTokenFile, cfg.JiraBaseURL, cfg.JiraProject, cfg.JiraJQL); err != nil {
+		return 0, err
+	}
+
+	var ts kelosv1alpha1.TaskSpawner
+	if err := cl.Get(ctx, key, &ts); err != nil {
+		return 0, fmt.Errorf("fetching TaskSpawner after cycle: %w", err)
+	}
+
+	if reportingEnabled(&ts) {
+		token, err := readGitHubToken(cfg.GitHubTokenFile)
+		if err != nil {
+			return 0, fmt.Errorf("reading GitHub token for reporting: %w", err)
+		}
+
+		reporter := &reporting.TaskReporter{
+			Client: cl,
+			Reporter: &reporting.GitHubReporter{
+				Owner:     cfg.GitHubOwner,
+				Repo:      cfg.GitHubRepo,
+				Token:     token,
+				TokenFile: cfg.GitHubTokenFile,
+				BaseURL:   cfg.GitHubAPIBaseURL,
+			},
+		}
+		if err := runReportingCycle(ctx, cl, key, reporter); err != nil {
+			return 0, err
+		}
+	}
+
+	return parsePollInterval(ts.Spec.PollInterval), nil
+}
+
+func (r *spawnerReconciler) requestsForTask(_ context.Context, obj client.Object) []reconcile.Request {
+	if !matchesSpawnerTask(obj, r.Key) {
+		return nil
+	}
+	return []reconcile.Request{{NamespacedName: r.Key}}
+}
+
+func (r *spawnerReconciler) taskSpawnerPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			return matchesNamespacedName(e.Object, r.Key)
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			if !matchesNamespacedName(e.ObjectNew, r.Key) {
+				return false
+			}
+			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration()
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return matchesNamespacedName(e.Object, r.Key)
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			return matchesNamespacedName(e.Object, r.Key)
+		},
+	}
+}
+
+func (r *spawnerReconciler) taskPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool {
+			return false
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldTask, okOld := e.ObjectOld.(*kelosv1alpha1.Task)
+			newTask, okNew := e.ObjectNew.(*kelosv1alpha1.Task)
+			if !okOld || !okNew || !matchesSpawnerTask(newTask, r.Key) {
+				return false
+			}
+
+			if oldTask.Status.Phase != newTask.Status.Phase {
+				return true
+			}
+
+			oldDeleting := oldTask.DeletionTimestamp != nil
+			newDeleting := newTask.DeletionTimestamp != nil
+			return oldDeleting != newDeleting
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return matchesSpawnerTask(e.Object, r.Key)
+		},
+		GenericFunc: func(event.GenericEvent) bool {
+			return false
+		},
+	}
+}
+
+func matchesNamespacedName(obj client.Object, key types.NamespacedName) bool {
+	if obj == nil {
+		return false
+	}
+	return obj.GetNamespace() == key.Namespace && obj.GetName() == key.Name
+}
+
+func matchesSpawnerTask(obj client.Object, key types.NamespacedName) bool {
+	if obj == nil {
+		return false
+	}
+	return obj.GetNamespace() == key.Namespace && obj.GetLabels()["kelos.dev/taskspawner"] == key.Name
+}

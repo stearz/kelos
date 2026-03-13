@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -13,11 +16,13 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
+	"github.com/kelos-dev/kelos/internal/reporting"
 	"github.com/kelos-dev/kelos/internal/source"
 )
 
@@ -1458,5 +1463,500 @@ func TestRunCycleWithSource_ExplicitUpstreamRepoTakesPrecedence(t *testing.T) {
 
 	if task.Spec.UpstreamRepo != "explicit-org/explicit-repo" {
 		t.Errorf("task.Spec.UpstreamRepo = %q, want %q", task.Spec.UpstreamRepo, "explicit-org/explicit-repo")
+	}
+}
+
+func TestSourceAnnotations_GitHubIssues(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{},
+			},
+		},
+	}
+
+	item := source.WorkItem{
+		ID:     "42",
+		Number: 42,
+		Kind:   "Issue",
+	}
+
+	annotations := sourceAnnotations(ts, item)
+	if annotations == nil {
+		t.Fatal("Expected annotations, got nil")
+	}
+	if annotations[reporting.AnnotationSourceKind] != "issue" {
+		t.Errorf("Expected source-kind 'issue', got %q", annotations[reporting.AnnotationSourceKind])
+	}
+	if annotations[reporting.AnnotationSourceNumber] != "42" {
+		t.Errorf("Expected source-number '42', got %q", annotations[reporting.AnnotationSourceNumber])
+	}
+	if _, ok := annotations[reporting.AnnotationGitHubReporting]; ok {
+		t.Error("Expected no github-reporting annotation when reporting is not enabled")
+	}
+}
+
+func TestSourceAnnotations_GitHubPR(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{},
+			},
+		},
+	}
+
+	item := source.WorkItem{
+		ID:     "7",
+		Number: 7,
+		Kind:   "PR",
+	}
+
+	annotations := sourceAnnotations(ts, item)
+	if annotations == nil {
+		t.Fatal("Expected annotations, got nil")
+	}
+	if annotations[reporting.AnnotationSourceKind] != "pull-request" {
+		t.Errorf("Expected source-kind 'pull-request', got %q", annotations[reporting.AnnotationSourceKind])
+	}
+	if annotations[reporting.AnnotationSourceNumber] != "7" {
+		t.Errorf("Expected source-number '7', got %q", annotations[reporting.AnnotationSourceNumber])
+	}
+}
+
+func TestSourceAnnotations_ReportingEnabled(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{
+					Reporting: &kelosv1alpha1.GitHubReporting{
+						Enabled: true,
+					},
+				},
+			},
+		},
+	}
+
+	item := source.WorkItem{
+		ID:     "1",
+		Number: 1,
+		Kind:   "Issue",
+	}
+
+	annotations := sourceAnnotations(ts, item)
+	if annotations[reporting.AnnotationGitHubReporting] != "enabled" {
+		t.Errorf("Expected github-reporting 'enabled', got %q", annotations[reporting.AnnotationGitHubReporting])
+	}
+}
+
+func TestSourceAnnotations_ReportingEnabledPR(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{
+					Reporting: &kelosv1alpha1.GitHubReporting{
+						Enabled: true,
+					},
+				},
+			},
+		},
+	}
+
+	item := source.WorkItem{
+		ID:     "5",
+		Number: 5,
+		Kind:   "PR",
+	}
+
+	annotations := sourceAnnotations(ts, item)
+	if annotations[reporting.AnnotationGitHubReporting] != "enabled" {
+		t.Errorf("Expected github-reporting 'enabled', got %q", annotations[reporting.AnnotationGitHubReporting])
+	}
+}
+
+func TestSourceAnnotations_NonGitHub(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				Jira: &kelosv1alpha1.Jira{},
+			},
+		},
+	}
+
+	item := source.WorkItem{
+		ID:     "1",
+		Number: 1,
+	}
+
+	annotations := sourceAnnotations(ts, item)
+	if annotations != nil {
+		t.Errorf("Expected nil annotations for non-GitHub source, got %v", annotations)
+	}
+}
+
+func TestRunCycleWithSource_AnnotationsStamped(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When.GitHubIssues.Reporting = &kelosv1alpha1.GitHubReporting{Enabled: true}
+	cl, key := setupTest(t, ts)
+
+	src := &fakeSource{
+		items: []source.WorkItem{
+			{ID: "42", Number: 42, Title: "Test Issue", Kind: "Issue"},
+		},
+	}
+
+	if err := runCycleWithSource(context.Background(), cl, key, src); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var task kelosv1alpha1.Task
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: "spawner-42", Namespace: "default"}, &task); err != nil {
+		t.Fatalf("Failed to get created task: %v", err)
+	}
+
+	if task.Annotations[reporting.AnnotationSourceKind] != "issue" {
+		t.Errorf("Expected source-kind 'issue', got %q", task.Annotations[reporting.AnnotationSourceKind])
+	}
+	if task.Annotations[reporting.AnnotationSourceNumber] != "42" {
+		t.Errorf("Expected source-number '42', got %q", task.Annotations[reporting.AnnotationSourceNumber])
+	}
+	if task.Annotations[reporting.AnnotationGitHubReporting] != "enabled" {
+		t.Errorf("Expected github-reporting 'enabled', got %q", task.Annotations[reporting.AnnotationGitHubReporting])
+	}
+}
+
+func TestReportingEnabled_IssuesEnabled(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{
+					Reporting: &kelosv1alpha1.GitHubReporting{Enabled: true},
+				},
+			},
+		},
+	}
+	if !reportingEnabled(ts) {
+		t.Error("Expected reporting to be enabled")
+	}
+}
+
+func TestReportingEnabled_IssuesDisabled(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{
+					Reporting: &kelosv1alpha1.GitHubReporting{Enabled: false},
+				},
+			},
+		},
+	}
+	if reportingEnabled(ts) {
+		t.Error("Expected reporting to be disabled")
+	}
+}
+
+func TestReportingEnabled_NoReportingField(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubIssues: &kelosv1alpha1.GitHubIssues{},
+			},
+		},
+	}
+	if reportingEnabled(ts) {
+		t.Error("Expected reporting to be disabled when Reporting is nil")
+	}
+}
+
+func TestReportingEnabled_PREnabled(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				GitHubPullRequests: &kelosv1alpha1.GitHubPullRequests{
+					Reporting: &kelosv1alpha1.GitHubReporting{Enabled: true},
+				},
+			},
+		},
+	}
+	if !reportingEnabled(ts) {
+		t.Error("Expected reporting to be enabled for PRs")
+	}
+}
+
+func TestReportingEnabled_Jira(t *testing.T) {
+	ts := &kelosv1alpha1.TaskSpawner{
+		Spec: kelosv1alpha1.TaskSpawnerSpec{
+			When: kelosv1alpha1.When{
+				Jira: &kelosv1alpha1.Jira{},
+			},
+		},
+	}
+	if reportingEnabled(ts) {
+		t.Error("Expected reporting to be disabled for Jira source")
+	}
+}
+
+func TestRunReportingCycle_ReportsForAnnotatedTasks(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.When.GitHubIssues.Reporting = &kelosv1alpha1.GitHubReporting{Enabled: true}
+
+	// Create a task with reporting annotations and a Pending phase
+	task := kelosv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "spawner-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				"kelos.dev/taskspawner": "spawner",
+			},
+			Annotations: map[string]string{
+				reporting.AnnotationGitHubReporting: "enabled",
+				reporting.AnnotationSourceNumber:    "42",
+				reporting.AnnotationSourceKind:      "issue",
+			},
+		},
+		Spec: kelosv1alpha1.TaskSpec{
+			Type:   "claude-code",
+			Prompt: "test",
+			Credentials: kelosv1alpha1.Credentials{
+				Type:      kelosv1alpha1.CredentialTypeOAuth,
+				SecretRef: kelosv1alpha1.SecretReference{Name: "creds"},
+			},
+		},
+		Status: kelosv1alpha1.TaskStatus{
+			Phase: kelosv1alpha1.TaskPhasePending,
+		},
+	}
+
+	cl, key := setupTest(t, ts, task)
+
+	// Set up a fake GitHub server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]int64{"id": 999})
+	}))
+	defer server.Close()
+
+	reporter := &reporting.TaskReporter{
+		Client: cl,
+		Reporter: &reporting.GitHubReporter{
+			Owner:   "owner",
+			Repo:    "repo",
+			Token:   "token",
+			BaseURL: server.URL,
+		},
+	}
+
+	if err := runReportingCycle(context.Background(), cl, key, reporter); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Verify annotations were updated
+	var updated kelosv1alpha1.Task
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(&task), &updated); err != nil {
+		t.Fatalf("Getting updated task: %v", err)
+	}
+	if updated.Annotations[reporting.AnnotationGitHubReportPhase] != "accepted" {
+		t.Errorf("Expected report phase 'accepted', got %q", updated.Annotations[reporting.AnnotationGitHubReportPhase])
+	}
+	if updated.Annotations[reporting.AnnotationGitHubCommentID] == "" {
+		t.Error("Expected comment ID to be set")
+	}
+}
+
+func TestRunReportingCycle_SkipsTasksWithoutReporting(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+
+	// Task without reporting annotations
+	task := kelosv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "spawner-1",
+			Namespace: "default",
+			Labels: map[string]string{
+				"kelos.dev/taskspawner": "spawner",
+			},
+		},
+		Spec: kelosv1alpha1.TaskSpec{
+			Type:   "claude-code",
+			Prompt: "test",
+			Credentials: kelosv1alpha1.Credentials{
+				Type:      kelosv1alpha1.CredentialTypeOAuth,
+				SecretRef: kelosv1alpha1.SecretReference{Name: "creds"},
+			},
+		},
+		Status: kelosv1alpha1.TaskStatus{
+			Phase: kelosv1alpha1.TaskPhasePending,
+		},
+	}
+
+	cl, key := setupTest(t, ts, task)
+
+	// Server should never be called
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("GitHub API should not be called for tasks without reporting")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	reporter := &reporting.TaskReporter{
+		Client: cl,
+		Reporter: &reporting.GitHubReporter{
+			Owner:   "owner",
+			Repo:    "repo",
+			Token:   "token",
+			BaseURL: server.URL,
+		},
+	}
+
+	if err := runReportingCycle(context.Background(), cl, key, reporter); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+}
+
+func TestRunOnce_ReturnsPollIntervalForSuspendedTaskSpawner(t *testing.T) {
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.Suspend = boolPtr(true)
+	ts.Spec.PollInterval = "30s"
+
+	cl, key := setupTest(t, ts)
+
+	interval, err := runOnce(context.Background(), cl, key, spawnerRuntimeConfig{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if interval != 30*time.Second {
+		t.Fatalf("Interval = %v, want %v", interval, 30*time.Second)
+	}
+
+	var updated kelosv1alpha1.TaskSpawner
+	if err := cl.Get(context.Background(), key, &updated); err != nil {
+		t.Fatalf("Getting updated TaskSpawner: %v", err)
+	}
+	if updated.Status.Phase != kelosv1alpha1.TaskSpawnerPhaseSuspended {
+		t.Fatalf("Phase = %q, want %q", updated.Status.Phase, kelosv1alpha1.TaskSpawnerPhaseSuspended)
+	}
+}
+
+func TestRunOnce_UsesEnvTokenForReporting(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "pat-token")
+
+	ts := newTaskSpawner("spawner", "default", nil)
+	ts.Spec.Suspend = boolPtr(true)
+	ts.Spec.When.GitHubIssues.Reporting = &kelosv1alpha1.GitHubReporting{Enabled: true}
+
+	task := newTask("spawner-1", "default", "spawner", kelosv1alpha1.TaskPhasePending)
+	task.Annotations = map[string]string{
+		reporting.AnnotationGitHubReporting: "enabled",
+		reporting.AnnotationSourceNumber:    "42",
+		reporting.AnnotationSourceKind:      "issue",
+	}
+
+	cl, key := setupTest(t, ts, task)
+
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]int64{"id": 999})
+	}))
+	defer server.Close()
+
+	_, err := runOnce(context.Background(), cl, key, spawnerRuntimeConfig{
+		GitHubOwner:      "owner",
+		GitHubRepo:       "repo",
+		GitHubAPIBaseURL: server.URL,
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if gotAuth != "token pat-token" {
+		t.Fatalf("Authorization = %q, want %q", gotAuth, "token pat-token")
+	}
+}
+
+func TestSpawnerReconcilerTaskSpawnerPredicate(t *testing.T) {
+	key := types.NamespacedName{Name: "spawner", Namespace: "default"}
+	r := &spawnerReconciler{Key: key}
+	p := r.taskSpawnerPredicate()
+
+	target := &kelosv1alpha1.TaskSpawner{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       key.Name,
+			Namespace:  key.Namespace,
+			Generation: 1,
+		},
+	}
+	if !p.Create(event.CreateEvent{Object: target}) {
+		t.Fatal("Expected create event for target TaskSpawner to pass predicate")
+	}
+
+	other := target.DeepCopy()
+	other.Name = "other"
+	if p.Create(event.CreateEvent{Object: other}) {
+		t.Fatal("Expected create event for other TaskSpawner to be ignored")
+	}
+
+	updated := target.DeepCopy()
+	updated.Generation = 2
+	if !p.Update(event.UpdateEvent{ObjectOld: target, ObjectNew: updated}) {
+		t.Fatal("Expected generation change to pass predicate")
+	}
+
+	statusOnly := updated.DeepCopy()
+	statusOnly.Status.Phase = kelosv1alpha1.TaskSpawnerPhaseRunning
+	if p.Update(event.UpdateEvent{ObjectOld: updated, ObjectNew: statusOnly}) {
+		t.Fatal("Expected status-only update to be ignored")
+	}
+}
+
+func TestSpawnerReconcilerTaskPredicate(t *testing.T) {
+	key := types.NamespacedName{Name: "spawner", Namespace: "default"}
+	r := &spawnerReconciler{Key: key}
+	p := r.taskPredicate()
+
+	base := newTask("spawner-1", "default", "spawner", kelosv1alpha1.TaskPhasePending)
+	oldTask := base.DeepCopy()
+	phaseChanged := base.DeepCopy()
+	phaseChanged.Status.Phase = kelosv1alpha1.TaskPhaseSucceeded
+
+	if !p.Update(event.UpdateEvent{ObjectOld: oldTask, ObjectNew: phaseChanged}) {
+		t.Fatal("Expected phase change to pass predicate")
+	}
+
+	annotationOnly := base.DeepCopy()
+	annotationOnly.Annotations = map[string]string{"kelos.dev/test": "value"}
+	if p.Update(event.UpdateEvent{ObjectOld: oldTask, ObjectNew: annotationOnly}) {
+		t.Fatal("Expected annotation-only update to be ignored")
+	}
+
+	if p.Create(event.CreateEvent{Object: base.DeepCopy()}) {
+		t.Fatal("Expected task create event to be ignored")
+	}
+	if !p.Delete(event.DeleteEvent{Object: base.DeepCopy()}) {
+		t.Fatal("Expected matching task delete event to pass predicate")
+	}
+
+	otherSpawnerTask := newTask("other-1", "default", "other", kelosv1alpha1.TaskPhasePending)
+	if p.Delete(event.DeleteEvent{Object: otherSpawnerTask.DeepCopy()}) {
+		t.Fatal("Expected other spawner task delete event to be ignored")
+	}
+}
+
+func TestSpawnerReconcilerRequestsForTask(t *testing.T) {
+	key := types.NamespacedName{Name: "spawner", Namespace: "default"}
+	r := &spawnerReconciler{Key: key}
+
+	task := newTask("spawner-1", "default", "spawner", kelosv1alpha1.TaskPhasePending)
+	requests := r.requestsForTask(context.Background(), task.DeepCopy())
+	if len(requests) != 1 {
+		t.Fatalf("Expected 1 request, got %d", len(requests))
+	}
+	if requests[0].NamespacedName != key {
+		t.Fatalf("Request key = %v, want %v", requests[0].NamespacedName, key)
+	}
+
+	other := newTask("other-1", "default", "other", kelosv1alpha1.TaskPhasePending)
+	requests = r.requestsForTask(context.Background(), other.DeepCopy())
+	if len(requests) != 0 {
+		t.Fatalf("Expected no requests for non-matching task, got %d", len(requests))
 	}
 }
