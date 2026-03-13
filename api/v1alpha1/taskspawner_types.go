@@ -45,6 +45,13 @@ type Cron struct {
 	Schedule string `json:"schedule"`
 }
 
+// GitHubReporting configures status reporting back to GitHub.
+type GitHubReporting struct {
+	// Enabled posts standard status comments back to the originating GitHub issue or PR.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+}
+
 // GitHubIssues discovers issues from a GitHub repository.
 // By default the repository owner and name are derived from the workspace's
 // repo URL specified in taskTemplate.workspaceRef. Set the Repo field to
@@ -113,6 +120,10 @@ type GitHubIssues struct {
 	// are scheduled last. When empty, items are processed in discovery order.
 	// +optional
 	PriorityLabels []string `json:"priorityLabels,omitempty"`
+
+	// Reporting configures status reporting back to the originating GitHub issue.
+	// +optional
+	Reporting *GitHubReporting `json:"reporting,omitempty"`
 }
 
 // GitHubPullRequests discovers pull requests from a GitHub repository.
@@ -184,6 +195,10 @@ type GitHubPullRequests struct {
 	// are scheduled last. When empty, items are processed in discovery order.
 	// +optional
 	PriorityLabels []string `json:"priorityLabels,omitempty"`
+
+	// Reporting configures status reporting back to the originating GitHub pull request.
+	// +optional
+	Reporting *GitHubReporting `json:"reporting,omitempty"`
 }
 
 // Jira discovers issues from a Jira project.

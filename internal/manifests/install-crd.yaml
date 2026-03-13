@@ -1184,6 +1184,15 @@ spec:
                           Use this for fork workflows where the workspace points to a fork
                           but issues should be discovered from the upstream repository.
                         type: string
+                      reporting:
+                        description: Reporting configures status reporting back to
+                          the originating GitHub issue.
+                        properties:
+                          enabled:
+                            description: Enabled posts standard status comments back
+                              to the originating GitHub issue or PR.
+                            type: boolean
+                        type: object
                       state:
                         default: open
                         description: State filters issues by state (open, closed,
@@ -1261,6 +1270,15 @@ spec:
                           Use this for fork workflows where the workspace points to a fork
                           but pull requests should be discovered from the upstream repository.
                         type: string
+                      reporting:
+                        description: Reporting configures status reporting back to
+                          the originating GitHub pull request.
+                        properties:
+                          enabled:
+                            description: Enabled posts standard status comments back
+                              to the originating GitHub issue or PR.
+                            type: boolean
+                        type: object
                       reviewState:
                         default: any
                         description: |-

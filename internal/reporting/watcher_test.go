@@ -1,0 +1,578 @@
+package reporting
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"sync"
+	"testing"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	kelosv1alpha1 "github.com/kelos-dev/kelos/api/v1alpha1"
+)
+
+func newTestScheme() *runtime.Scheme {
+	s := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(s))
+	utilruntime.Must(kelosv1alpha1.AddToScheme(s))
+	return s
+}
+
+type commentRecord struct {
+	method string
+	number int
+	id     int64
+	body   string
+}
+
+type conflictOnceClient struct {
+	client.Client
+	mu                 sync.Mutex
+	remainingConflicts int
+}
+
+func (c *conflictOnceClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.remainingConflicts > 0 {
+		c.remainingConflicts--
+		return apierrors.NewConflict(
+			schema.GroupResource{Group: "kelos.dev", Resource: "tasks"},
+			obj.GetName(),
+			errors.New("conflict"),
+		)
+	}
+
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func newTestServer(t *testing.T) (*httptest.Server, *[]commentRecord) {
+	t.Helper()
+	var (
+		mu      sync.Mutex
+		records []commentRecord
+		nextID  int64 = 1000
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		var body createCommentRequest
+		json.NewDecoder(r.Body).Decode(&body)
+
+		switch r.Method {
+		case http.MethodPost:
+			nextID++
+			records = append(records, commentRecord{
+				method: "create",
+				body:   body.Body,
+			})
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(commentResponse{ID: nextID})
+		case http.MethodPatch:
+			records = append(records, commentRecord{
+				method: "update",
+				body:   body.Body,
+			})
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(commentResponse{})
+		}
+	}))
+
+	return server, &records
+}
+
+func newTaskWithAnnotations(name, namespace string, phase kelosv1alpha1.TaskPhase, annotations map[string]string) *kelosv1alpha1.Task {
+	return &kelosv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   namespace,
+			Annotations: annotations,
+		},
+		Spec: kelosv1alpha1.TaskSpec{
+			Type:   "claude-code",
+			Prompt: "test",
+			Credentials: kelosv1alpha1.Credentials{
+				Type:      kelosv1alpha1.CredentialTypeOAuth,
+				SecretRef: kelosv1alpha1.SecretReference{Name: "creds"},
+			},
+		},
+		Status: kelosv1alpha1.TaskStatus{
+			Phase: phase,
+		},
+	}
+}
+
+func TestReportTaskStatus_CreatesCommentOnPending(t *testing.T) {
+	server, records := newTestServer(t)
+	defer server.Close()
+
+	task := newTaskWithAnnotations("test-task", "default", kelosv1alpha1.TaskPhasePending, map[string]string{
+		AnnotationGitHubReporting: "enabled",
+		AnnotationSourceNumber:    "42",
+		AnnotationSourceKind:      "issue",
+	})
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithObjects(task).
+		Build()
+
+	reporter := &GitHubReporter{
+		Owner:   "owner",
+		Repo:    "repo",
+		Token:   "token",
+		BaseURL: server.URL,
+	}
+
+	tr := &TaskReporter{
+		Client:   cl,
+		Reporter: reporter,
+	}
+
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if len(*records) != 1 {
+		t.Fatalf("Expected 1 API call, got %d", len(*records))
+	}
+	if (*records)[0].method != "create" {
+		t.Errorf("Expected create, got %s", (*records)[0].method)
+	}
+
+	// Verify annotations were persisted
+	var updated kelosv1alpha1.Task
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(task), &updated); err != nil {
+		t.Fatalf("Getting updated task: %v", err)
+	}
+	if updated.Annotations[AnnotationGitHubReportPhase] != "accepted" {
+		t.Errorf("Expected report phase 'accepted', got %q", updated.Annotations[AnnotationGitHubReportPhase])
+	}
+	if updated.Annotations[AnnotationGitHubCommentID] == "" {
+		t.Error("Expected comment ID to be set")
+	}
+}
+
+func TestReportTaskStatus_UpdatesCommentOnSucceeded(t *testing.T) {
+	server, records := newTestServer(t)
+	defer server.Close()
+
+	task := newTaskWithAnnotations("test-task", "default", kelosv1alpha1.TaskPhaseSucceeded, map[string]string{
+		AnnotationGitHubReporting:   "enabled",
+		AnnotationSourceNumber:      "42",
+		AnnotationSourceKind:        "issue",
+		AnnotationGitHubCommentID:   "5555",
+		AnnotationGitHubReportPhase: "accepted",
+	})
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithObjects(task).
+		Build()
+
+	reporter := &GitHubReporter{
+		Owner:   "owner",
+		Repo:    "repo",
+		Token:   "token",
+		BaseURL: server.URL,
+	}
+
+	tr := &TaskReporter{
+		Client:   cl,
+		Reporter: reporter,
+	}
+
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if len(*records) != 1 {
+		t.Fatalf("Expected 1 API call, got %d", len(*records))
+	}
+	if (*records)[0].method != "update" {
+		t.Errorf("Expected update, got %s", (*records)[0].method)
+	}
+
+	var updated kelosv1alpha1.Task
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(task), &updated); err != nil {
+		t.Fatalf("Getting updated task: %v", err)
+	}
+	if updated.Annotations[AnnotationGitHubReportPhase] != "succeeded" {
+		t.Errorf("Expected report phase 'succeeded', got %q", updated.Annotations[AnnotationGitHubReportPhase])
+	}
+}
+
+func TestReportTaskStatus_UpdatesCommentOnFailed(t *testing.T) {
+	server, records := newTestServer(t)
+	defer server.Close()
+
+	task := newTaskWithAnnotations("test-task", "default", kelosv1alpha1.TaskPhaseFailed, map[string]string{
+		AnnotationGitHubReporting:   "enabled",
+		AnnotationSourceNumber:      "42",
+		AnnotationSourceKind:        "issue",
+		AnnotationGitHubCommentID:   "5555",
+		AnnotationGitHubReportPhase: "accepted",
+	})
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithObjects(task).
+		Build()
+
+	reporter := &GitHubReporter{
+		Owner:   "owner",
+		Repo:    "repo",
+		Token:   "token",
+		BaseURL: server.URL,
+	}
+
+	tr := &TaskReporter{
+		Client:   cl,
+		Reporter: reporter,
+	}
+
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if len(*records) != 1 {
+		t.Fatalf("Expected 1 API call, got %d", len(*records))
+	}
+
+	var updated kelosv1alpha1.Task
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(task), &updated); err != nil {
+		t.Fatalf("Getting updated task: %v", err)
+	}
+	if updated.Annotations[AnnotationGitHubReportPhase] != "failed" {
+		t.Errorf("Expected report phase 'failed', got %q", updated.Annotations[AnnotationGitHubReportPhase])
+	}
+}
+
+func TestReportTaskStatus_SkipsDuplicateReport(t *testing.T) {
+	server, records := newTestServer(t)
+	defer server.Close()
+
+	task := newTaskWithAnnotations("test-task", "default", kelosv1alpha1.TaskPhasePending, map[string]string{
+		AnnotationGitHubReporting:   "enabled",
+		AnnotationSourceNumber:      "42",
+		AnnotationSourceKind:        "issue",
+		AnnotationGitHubCommentID:   "5555",
+		AnnotationGitHubReportPhase: "accepted", // Already reported
+	})
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithObjects(task).
+		Build()
+
+	reporter := &GitHubReporter{
+		Owner:   "owner",
+		Repo:    "repo",
+		Token:   "token",
+		BaseURL: server.URL,
+	}
+
+	tr := &TaskReporter{
+		Client:   cl,
+		Reporter: reporter,
+	}
+
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// No API calls should have been made since it was already reported
+	if len(*records) != 0 {
+		t.Errorf("Expected 0 API calls (already reported), got %d", len(*records))
+	}
+}
+
+func TestReportTaskStatus_SkipsWithoutReportingAnnotation(t *testing.T) {
+	server, records := newTestServer(t)
+	defer server.Close()
+
+	task := newTaskWithAnnotations("test-task", "default", kelosv1alpha1.TaskPhasePending, map[string]string{
+		AnnotationSourceNumber: "42",
+		AnnotationSourceKind:   "issue",
+		// No AnnotationGitHubReporting
+	})
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithObjects(task).
+		Build()
+
+	reporter := &GitHubReporter{
+		Owner:   "owner",
+		Repo:    "repo",
+		Token:   "token",
+		BaseURL: server.URL,
+	}
+
+	tr := &TaskReporter{
+		Client:   cl,
+		Reporter: reporter,
+	}
+
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if len(*records) != 0 {
+		t.Errorf("Expected 0 API calls (reporting not enabled), got %d", len(*records))
+	}
+}
+
+func TestReportTaskStatus_SkipsEmptyPhase(t *testing.T) {
+	server, records := newTestServer(t)
+	defer server.Close()
+
+	task := newTaskWithAnnotations("test-task", "default", "", map[string]string{
+		AnnotationGitHubReporting: "enabled",
+		AnnotationSourceNumber:    "42",
+		AnnotationSourceKind:      "issue",
+	})
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithObjects(task).
+		Build()
+
+	reporter := &GitHubReporter{
+		Owner:   "owner",
+		Repo:    "repo",
+		Token:   "token",
+		BaseURL: server.URL,
+	}
+
+	tr := &TaskReporter{
+		Client:   cl,
+		Reporter: reporter,
+	}
+
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if len(*records) != 0 {
+		t.Errorf("Expected 0 API calls (empty phase), got %d", len(*records))
+	}
+}
+
+func TestReportTaskStatus_RunningMapsToAccepted(t *testing.T) {
+	server, records := newTestServer(t)
+	defer server.Close()
+
+	task := newTaskWithAnnotations("test-task", "default", kelosv1alpha1.TaskPhaseRunning, map[string]string{
+		AnnotationGitHubReporting: "enabled",
+		AnnotationSourceNumber:    "42",
+		AnnotationSourceKind:      "issue",
+	})
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithObjects(task).
+		Build()
+
+	reporter := &GitHubReporter{
+		Owner:   "owner",
+		Repo:    "repo",
+		Token:   "token",
+		BaseURL: server.URL,
+	}
+
+	tr := &TaskReporter{
+		Client:   cl,
+		Reporter: reporter,
+	}
+
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if len(*records) != 1 {
+		t.Fatalf("Expected 1 API call, got %d", len(*records))
+	}
+
+	var updated kelosv1alpha1.Task
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(task), &updated); err != nil {
+		t.Fatalf("Getting updated task: %v", err)
+	}
+	if updated.Annotations[AnnotationGitHubReportPhase] != "accepted" {
+		t.Errorf("Expected report phase 'accepted' for Running task, got %q", updated.Annotations[AnnotationGitHubReportPhase])
+	}
+}
+
+func TestReportTaskStatus_CreatesNewCommentWhenNoCommentID(t *testing.T) {
+	server, records := newTestServer(t)
+	defer server.Close()
+
+	// Task with succeeded phase but no comment ID (e.g. short-lived task)
+	task := newTaskWithAnnotations("test-task", "default", kelosv1alpha1.TaskPhaseSucceeded, map[string]string{
+		AnnotationGitHubReporting: "enabled",
+		AnnotationSourceNumber:    "42",
+		AnnotationSourceKind:      "issue",
+	})
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithObjects(task).
+		Build()
+
+	reporter := &GitHubReporter{
+		Owner:   "owner",
+		Repo:    "repo",
+		Token:   "token",
+		BaseURL: server.URL,
+	}
+
+	tr := &TaskReporter{
+		Client:   cl,
+		Reporter: reporter,
+	}
+
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if len(*records) != 1 {
+		t.Fatalf("Expected 1 API call, got %d", len(*records))
+	}
+	// Should create, not update, since no comment ID exists
+	if (*records)[0].method != "create" {
+		t.Errorf("Expected create for task with no comment ID, got %s", (*records)[0].method)
+	}
+
+	var updated kelosv1alpha1.Task
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(task), &updated); err != nil {
+		t.Fatalf("Getting updated task: %v", err)
+	}
+	commentID, err := strconv.ParseInt(updated.Annotations[AnnotationGitHubCommentID], 10, 64)
+	if err != nil || commentID == 0 {
+		t.Errorf("Expected valid comment ID, got %q", updated.Annotations[AnnotationGitHubCommentID])
+	}
+}
+
+func TestReportTaskStatus_RetriesAnnotationPersistenceOnConflict(t *testing.T) {
+	server, records := newTestServer(t)
+	defer server.Close()
+
+	task := newTaskWithAnnotations("test-task", "default", kelosv1alpha1.TaskPhasePending, map[string]string{
+		AnnotationGitHubReporting: "enabled",
+		AnnotationSourceNumber:    "42",
+		AnnotationSourceKind:      "issue",
+	})
+
+	baseClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithObjects(task).
+		Build()
+
+	cl := &conflictOnceClient{
+		Client:             baseClient,
+		remainingConflicts: 1,
+	}
+
+	reporter := &GitHubReporter{
+		Owner:   "owner",
+		Repo:    "repo",
+		Token:   "token",
+		BaseURL: server.URL,
+	}
+
+	tr := &TaskReporter{
+		Client:   cl,
+		Reporter: reporter,
+	}
+
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if len(*records) != 1 {
+		t.Fatalf("Expected 1 API call, got %d", len(*records))
+	}
+	if (*records)[0].method != "create" {
+		t.Fatalf("Expected create, got %s", (*records)[0].method)
+	}
+
+	var updated kelosv1alpha1.Task
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(task), &updated); err != nil {
+		t.Fatalf("Getting updated task: %v", err)
+	}
+	if updated.Annotations[AnnotationGitHubReportPhase] != "accepted" {
+		t.Errorf("Expected report phase 'accepted', got %q", updated.Annotations[AnnotationGitHubReportPhase])
+	}
+	if updated.Annotations[AnnotationGitHubCommentID] == "" {
+		t.Error("Expected comment ID to be set")
+	}
+}
+
+func TestReportTaskStatus_CorruptedCommentIDReturnsError(t *testing.T) {
+	task := newTaskWithAnnotations("test-task", "default", kelosv1alpha1.TaskPhasePending, map[string]string{
+		AnnotationGitHubReporting: "enabled",
+		AnnotationSourceNumber:    "42",
+		AnnotationSourceKind:      "issue",
+		AnnotationGitHubCommentID: "not-a-number",
+	})
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithObjects(task).
+		Build()
+
+	reporter := &GitHubReporter{Owner: "o", Repo: "r", Token: "t"}
+	tr := &TaskReporter{Client: cl, Reporter: reporter}
+
+	err := tr.ReportTaskStatus(context.Background(), task)
+	if err == nil {
+		t.Fatal("Expected error for corrupted comment ID, got nil")
+	}
+}
+
+func TestReportTaskStatus_NilAnnotations(t *testing.T) {
+	task := &kelosv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-task",
+			Namespace: "default",
+		},
+		Spec: kelosv1alpha1.TaskSpec{
+			Type:   "claude-code",
+			Prompt: "test",
+			Credentials: kelosv1alpha1.Credentials{
+				Type:      kelosv1alpha1.CredentialTypeOAuth,
+				SecretRef: kelosv1alpha1.SecretReference{Name: "creds"},
+			},
+		},
+		Status: kelosv1alpha1.TaskStatus{
+			Phase: kelosv1alpha1.TaskPhasePending,
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(newTestScheme()).
+		WithObjects(task).
+		Build()
+
+	reporter := &GitHubReporter{Owner: "o", Repo: "r", Token: "t"}
+	tr := &TaskReporter{Client: cl, Reporter: reporter}
+
+	// Should not error when annotations are nil
+	if err := tr.ReportTaskStatus(context.Background(), task); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+}
