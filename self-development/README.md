@@ -266,6 +266,7 @@ Checks the following coding agents for updates:
 - **codex** — `@openai/codex` npm package
 - **gemini** — `@google/gemini-cli` npm package
 - **opencode** — `opencode-ai` npm package
+- **cursor** — binary download, version discovered from `https://cursor.com/install`
 
 Creates at most one PR per agent. Skips agents that are already up to date or already have an open update PR.
 

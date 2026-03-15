@@ -88,9 +88,9 @@ spec:
       3. Compare the current version with the latest version
       4. Before creating a PR, validate that the download binary actually exists:
          ```
-         curl -sfI "https://downloads.cursor.com/lab/<latest-version>/linux/x64/agent-cli-package.tar.gz"
+         curl -so /dev/null -w '%{http_code}' "https://downloads.cursor.com/lab/<latest-version>/linux/x64/agent-cli-package.tar.gz"
          ```
-         Only proceed if an HTTP 200 response is returned. If the URL returns a non-200 status, skip cursor for this run.
+         Only proceed if the returned HTTP status code is exactly `200`. If the URL returns any other status (including redirects like 302), skip cursor for this run.
 
       Then for each agent that has a newer version available:
       1. First check if an open PR already exists for updating that agent:
