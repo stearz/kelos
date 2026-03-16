@@ -26,20 +26,23 @@ const (
 
 // GitHubSource discovers issues from a GitHub repository.
 type GitHubSource struct {
-	Owner           string
-	Repo            string
-	Types           []string
-	Labels          []string
-	ExcludeLabels   []string
-	State           string
-	Assignee        string
-	Author          string
-	Token           string
-	BaseURL         string
-	Client          *http.Client
-	TriggerComment  string
-	ExcludeComments []string
-	PriorityLabels  []string
+	Owner             string
+	Repo              string
+	Types             []string
+	Labels            []string
+	ExcludeLabels     []string
+	State             string
+	Assignee          string
+	Author            string
+	Token             string
+	BaseURL           string
+	Client            *http.Client
+	TriggerComment    string
+	ExcludeComments   []string
+	AllowedUsers      []string
+	AllowedTeams      []string
+	MinimumPermission string
+	PriorityLabels    []string
 }
 
 type githubIssue struct {
@@ -48,6 +51,7 @@ type githubIssue struct {
 	Body        string        `json:"body"`
 	HTMLURL     string        `json:"html_url"`
 	Labels      []githubLabel `json:"labels"`
+	User        githubUser    `json:"user"`
 	PullRequest *struct{}     `json:"pull_request,omitempty"`
 }
 
@@ -56,8 +60,9 @@ type githubLabel struct {
 }
 
 type githubComment struct {
-	Body      string `json:"body"`
-	CreatedAt string `json:"created_at"`
+	Body      string     `json:"body"`
+	CreatedAt string     `json:"created_at"`
+	User      githubUser `json:"user"`
 }
 
 func (s *GitHubSource) baseURL() string {
@@ -83,7 +88,21 @@ func (s *GitHubSource) Discover(ctx context.Context) ([]WorkItem, error) {
 
 	issues = s.filterItems(issues)
 
+	policy := githubCommentPolicy{
+		TriggerComment:    s.TriggerComment,
+		ExcludeComments:   s.ExcludeComments,
+		AllowedUsers:      s.AllowedUsers,
+		AllowedTeams:      s.AllowedTeams,
+		MinimumPermission: s.MinimumPermission,
+	}
 	needsCommentFilter := s.TriggerComment != "" || len(s.ExcludeComments) > 0
+	var authorizer *githubCommentAuthorizer
+	if needsCommentFilter {
+		authorizer, err = newGitHubCommentAuthorizer(s.Owner, s.Repo, s.baseURL(), s.Token, s.httpClient(), policy)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	var items []WorkItem
 	for _, issue := range issues {
@@ -99,8 +118,16 @@ func (s *GitHubSource) Discover(ctx context.Context) ([]WorkItem, error) {
 
 		comments := concatCommentBodies(rawComments)
 
-		if needsCommentFilter && !s.passesCommentFilter(issue.Body, comments) {
-			continue
+		var triggerTime time.Time
+		if needsCommentFilter {
+			commentAllowed, resolvedTriggerTime, err := evaluateGitHubCommentPolicy(ctx, issue.Body, issue.User, rawComments, policy, authorizer)
+			if err != nil {
+				return nil, fmt.Errorf("evaluating comment policy for issue #%d: %w", issue.Number, err)
+			}
+			if !commentAllowed {
+				continue
+			}
+			triggerTime = resolvedTriggerTime
 		}
 
 		kind := "Issue"
@@ -122,7 +149,7 @@ func (s *GitHubSource) Discover(ctx context.Context) ([]WorkItem, error) {
 		// Record the timestamp of the most recent trigger comment so the
 		// spawner can retrigger completed tasks when a new trigger arrives.
 		if s.TriggerComment != "" {
-			item.TriggerTime = latestTriggerTime(rawComments, s.TriggerComment)
+			item.TriggerTime = triggerTime
 		}
 
 		items = append(items, item)
