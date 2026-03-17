@@ -18,9 +18,9 @@ const (
 	TaskSpawnerPhaseSuspended TaskSpawnerPhase = "Suspended"
 )
 
-// When defines the conditions that trigger task spawning.
+// On defines the conditions that trigger task spawning.
 // Exactly one field must be set.
-type When struct {
+type On struct {
 	// GitHubIssues discovers issues from a GitHub repository.
 	// +optional
 	GitHubIssues *GitHubIssues `json:"githubIssues,omitempty"`
@@ -380,12 +380,12 @@ type TaskSpawnerSpec struct {
 	// On defines the conditions that trigger task spawning.
 	// Exactly one of on or when must be set.
 	// +optional
-	On *When `json:"on,omitempty"`
+	On *On `json:"on,omitempty"`
 
 	// When defines the conditions that trigger task spawning.
 	// Deprecated: Use on instead. This field will be removed in the next API version.
 	// +optional
-	When *When `json:"when,omitempty"`
+	When *On `json:"when,omitempty"`
 
 	// TaskTemplate defines the template for spawned Tasks.
 	// +kubebuilder:validation:Required
@@ -424,7 +424,7 @@ type TaskSpawnerSpec struct {
 
 // EffectiveOn returns the effective trigger configuration.
 // It returns On if set, otherwise falls back to When.
-func (s *TaskSpawnerSpec) EffectiveOn() *When {
+func (s *TaskSpawnerSpec) EffectiveOn() *On {
 	if s.On != nil {
 		return s.On
 	}

@@ -6,29 +6,29 @@ func TestEffectiveOn(t *testing.T) {
 	tests := []struct {
 		name string
 		spec TaskSpawnerSpec
-		want *When
+		want *On
 	}{
 		{
 			name: "returns On when On is set",
 			spec: TaskSpawnerSpec{
-				On: &When{GitHubIssues: &GitHubIssues{}},
+				On: &On{GitHubIssues: &GitHubIssues{}},
 			},
-			want: &When{GitHubIssues: &GitHubIssues{}},
+			want: &On{GitHubIssues: &GitHubIssues{}},
 		},
 		{
 			name: "returns When when only When is set",
 			spec: TaskSpawnerSpec{
-				When: &When{Cron: &Cron{Schedule: "0 9 * * 1"}},
+				When: &On{Cron: &Cron{Schedule: "0 9 * * 1"}},
 			},
-			want: &When{Cron: &Cron{Schedule: "0 9 * * 1"}},
+			want: &On{Cron: &Cron{Schedule: "0 9 * * 1"}},
 		},
 		{
 			name: "prefers On over When when both are set",
 			spec: TaskSpawnerSpec{
-				On:   &When{GitHubIssues: &GitHubIssues{}},
-				When: &When{Cron: &Cron{Schedule: "0 9 * * 1"}},
+				On:   &On{GitHubIssues: &GitHubIssues{}},
+				When: &On{Cron: &Cron{Schedule: "0 9 * * 1"}},
 			},
-			want: &When{GitHubIssues: &GitHubIssues{}},
+			want: &On{GitHubIssues: &GitHubIssues{}},
 		},
 		{
 			name: "returns nil when neither is set",
