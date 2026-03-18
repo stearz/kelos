@@ -93,15 +93,15 @@ func TestInitCommand_ConfigContainsCredentialURLs(t *testing.T) {
 	}
 
 	content := string(data)
-	expectedURLs := []string{
-		"https://claude.ai/settings/developer",
+	expectedStrings := []string{
+		"claude setup-token",
 		"https://console.anthropic.com/settings/keys",
 		"https://platform.openai.com/api-keys",
 		"https://aistudio.google.com/app/apikey",
 	}
-	for _, url := range expectedURLs {
-		if !strings.Contains(content, url) {
-			t.Errorf("config file missing credential URL: %s", url)
+	for _, s := range expectedStrings {
+		if !strings.Contains(content, s) {
+			t.Errorf("config file missing credential info: %s", s)
 		}
 	}
 }

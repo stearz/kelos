@@ -24,7 +24,7 @@ oauthToken: ""
 
 # Where to get credentials for each agent type:
 #   claude-code:
-#     OAuth token: https://claude.ai/settings/developer
+#     OAuth token: run "claude setup-token" (recommended, generates a long-lived token)
 #     API key:     https://console.anthropic.com/settings/keys
 #   codex:
 #     API key:     https://platform.openai.com/api-keys

@@ -188,7 +188,7 @@ workspace:
 <summary>How to get your credentials</summary>
 
 **Claude OAuth token** (recommended for Claude Code):
-Run `claude auth login` locally, then copy the token from `~/.claude/credentials.json`.
+Run `claude setup-token` locally and follow the prompts. This generates a long-lived token (valid for ~1 year). Copy the token from `~/.claude/credentials.json`.
 
 **Anthropic API key** (alternative for Claude Code):
 Create one at [console.anthropic.com](https://console.anthropic.com). Set `apiKey` instead of `oauthToken` in your config.
