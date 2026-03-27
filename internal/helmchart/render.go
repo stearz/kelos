@@ -104,11 +104,12 @@ var installOrderMap = map[string]int{
 	"ClusterRoleBinding": 5,
 	"Role":               6,
 	"RoleBinding":        7,
-	"Service":            8,
-	"Deployment":         9,
-	"StatefulSet":        10,
-	"Job":                11,
-	"CronJob":            12,
+	"NetworkPolicy":      8,
+	"Service":            9,
+	"Deployment":         10,
+	"StatefulSet":        11,
+	"Job":                12,
+	"CronJob":            13,
 }
 
 func kindOrder(kind string) int {

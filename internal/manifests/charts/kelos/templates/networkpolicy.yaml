@@ -1,0 +1,39 @@
+{{- if .Values.networkpolicies.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kelos-default-deny
+  namespace: kelos-system
+  labels:
+    app.kubernetes.io/name: kelos
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kelos-controller-allow
+  namespace: kelos-system
+  labels:
+    app.kubernetes.io/name: kelos
+    app.kubernetes.io/component: network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: manager
+  policyTypes:
+    {{- toYaml .Values.networkpolicies.policyTypes | nindent 4 }}
+  {{- if .Values.networkpolicies.rules.ingress }}
+  ingress:
+    {{- toYaml .Values.networkpolicies.rules.ingress | nindent 4 }}
+  {{- end }}
+  {{- if .Values.networkpolicies.rules.egress }}
+  egress:
+    {{- toYaml .Values.networkpolicies.rules.egress | nindent 4 }}
+  {{- end }}
+{{- end }}

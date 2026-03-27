@@ -21,3 +21,63 @@ controller:
   resources:
     requests: {}
     limits: {}
+
+networkpolicies:
+  enabled: false
+  policyTypes:
+    - Ingress
+    - Egress
+  rules:
+    ingress:
+      # Allow metrics scraping on port 8080
+      - from:
+          - namespaceSelector: {}
+        ports:
+          - protocol: TCP
+            port: 8080
+      # Allow health checks on port 8081
+      - from:
+          - namespaceSelector: {}
+        ports:
+          - protocol: TCP
+            port: 8081
+    egress:
+      # Allow DNS queries to kube-system
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: kube-system
+            podSelector:
+              matchLabels:
+                k8s-app: kube-dns
+        ports:
+          - protocol: UDP
+            port: 53
+          - protocol: TCP
+            port: 53
+      # Allow Kubernetes API access
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: default
+        ports:
+          - protocol: TCP
+            port: 443
+      # Allow communication within kelos-system namespace
+      - to:
+          - podSelector: {}
+        ports:
+          - protocol: TCP
+      # Allow external HTTPS for telemetry and external services
+      - to:
+          - ipBlock:
+              cidr: 0.0.0.0/0
+              except:
+                - 10.0.0.0/8
+                - 172.16.0.0/12
+                - 192.168.0.0/16
+                - 169.254.0.0/16
+                - 100.64.0.0/10
+        ports:
+          - protocol: TCP
+            port: 443

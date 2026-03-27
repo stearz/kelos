@@ -175,6 +175,10 @@ func TestRenderChart_DefaultValues(t *testing.T) {
 			t.Errorf("expected to find %s in rendered chart", expected)
 		}
 	}
+	// NetworkPolicy should not be present by default
+	if kinds["NetworkPolicy"] {
+		t.Error("expected no NetworkPolicy when networkpolicies.enabled is false by default")
+	}
 }
 
 func TestRenderChart_VersionSubstitution(t *testing.T) {
